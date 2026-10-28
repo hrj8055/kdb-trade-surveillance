@@ -1,0 +1,14 @@
+{
+  "host": "localhost",
+  "ports": {"tp": 5010, "rdb": 5011, "rte": 5012, "hdb": 5013, "gw": 5014},
+  "paths": {"tplog": "data/tplog", "hdb": "data/hdb", "recordings": "data/recordings"},
+  "syms": ["BTCUSDT", "ETHUSDT"],
+  "tickSize": {"BTCUSDT": 0.01, "ETHUSDT": 0.01},
+  "generator": {
+    "traders": 20,
+    "rate": 20,
+    "seed": 42,
+    "qtyRange": {"BTCUSDT": [0.001, 0.05], "ETHUSDT": [0.01, 1.0]},
+    "maxTicksFromMid": 20
+  }
+}

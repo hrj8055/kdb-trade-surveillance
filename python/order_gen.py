@@ -1,42 +1,46 @@
 # python/order_gen.py
-# SIMULATED trader activity around the LIVE mid price. Normal flow only (abuse comes in Step 3).
-# usage: python python/order_gen.py [--rate 20] [--seed 42]
+# SIMULATED trader activity around the LIVE market. Normal flow only (abuse comes in Step 3).
+# Market data is PUSHED: we subscribe to quotes on the TP (RawQConnection + poll_recv),
+# following the official PyKX subscriber pattern, instead of polling the RDB.
+# usage: python python/order_gen.py [--rate N] [--seed N]
 
 import argparse
+import asyncio
 import random
-import sys
 import time
 
 import pykx as kx
 
-SYMS = ["BTCUSDT", "ETHUSDT"]
-TICK = 0.01
-QTY = {"BTCUSDT": (0.001, 0.05), "ETHUSDT": (0.01, 1.0)}   # normal order size range
-TRADERS = [f"T{i:02d}" for i in range(1, 21)]              # T01 .. T20
+from common import CFG, connect, get_logger
 
-
-def connect(port, name):
-    try:
-        return kx.SyncQConnection(host="localhost", port=port)
-    except kx.QError:
-        sys.exit(f"Cannot reach the {name} on port {port}. Start it first.")
+log = get_logger("order_gen")
+G = CFG["generator"]
+SYMS = CFG["syms"]
+TICK = CFG["tickSize"]
+QTY = G["qtyRange"]
+TRADERS = [f"T{i:02d}" for i in range(1, G["traders"] + 1)]
 
 
 class Sim:
     def __init__(self, tp, rdb, seed):
-        self.tp, self.rdb = tp, rdb
+        self.tp = tp
         self.rng = random.Random(seed)
         self.mid = {}
         self.open = {}   # orderId -> {sym, trader, side, price, qty}
-        # continue IDs from what the RDB already has (0^ turns an empty max into 0)
+        # continue IDs from the RDB (0| turns an empty max, which is -0W, into 0)
         self.next_oid = int(rdb("0|exec max orderId from orders").py()) + 1
         self.next_tid = int(rdb("0|exec max tradeId from trades").py()) + 1
-        self.stats = {"new": 0, "amend": 0, "cancel": 0, "fill": 0, "trades": 0}
+        self.stats = {"new": 0, "amend": 0, "cancel": 0, "fill": 0, "trades": 0, "quotesIn": 0}
 
-    # ---------- market data from kdb ----------
-    def refresh_mid(self):
-        q = "exec sym!0.5*bid+ask from 0!select last bid, last ask by sym from quotes"
-        self.mid.update({k: v for k, v in self.rdb(q).py().items() if k in SYMS})
+    # ---------- market data, pushed by the TP ----------
+    def drain_quotes(self, sub):
+        """Apply every quote the TP has pushed since we last looked (non-blocking)."""
+        while (msg := sub.poll_recv()) is not None:
+            if msg[0] == "upd" and msg[1] == "quotes":
+                d = msg[2]
+                for s, b, a in zip(d["sym"].py(), d["bid"].py(), d["ask"].py()):
+                    self.mid[s] = 0.5 * (b + a)
+                    self.stats["quotesIn"] += 1
 
     # ---------- publishing (explicit q types) ----------
     def pub_order(self, oid, o, action, price=None, qty=None):
@@ -61,8 +65,8 @@ class Sim:
     def new_order(self):
         sym = self.rng.choice(SYMS)
         side = self.rng.choice(["buy", "sell"])
-        ticks = self.rng.randint(1, 20)                      # passive: 1-20 ticks from mid
-        px = self.mid[sym] + (-ticks if side == "buy" else ticks) * TICK
+        ticks = self.rng.randint(1, G["maxTicksFromMid"])
+        px = self.mid[sym] + (-ticks if side == "buy" else ticks) * TICK[sym]
         lo, hi = QTY[sym]
         o = {"sym": sym, "trader": self.rng.choice(TRADERS), "side": side,
              "price": round(px, 2), "qty": round(self.rng.uniform(lo, hi), 4)}
@@ -78,7 +82,7 @@ class Sim:
     def amend(self):
         oid = self.rng.choice(list(self.open))
         o = self.open[oid]
-        o["price"] = round(o["price"] + self.rng.choice([-3, -2, -1, 1, 2, 3]) * TICK, 2)
+        o["price"] = round(o["price"] + self.rng.choice([-3, -2, -1, 1, 2, 3]) * TICK[o["sym"]], 2)
         self.pub_order(oid, o, "amend")
 
     def fill(self):
@@ -112,38 +116,41 @@ class Sim:
             self.fill()
 
 
-def main():
+async def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tp", type=int, default=5010)
-    ap.add_argument("--rdb", type=int, default=5011)
-    ap.add_argument("--rate", type=float, default=20, help="events per second")
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--mid-every", type=float, default=0.1, help="seconds between mid refreshes")
+    ap.add_argument("--rate", type=float, default=G["rate"], help="events per second")
+    ap.add_argument("--seed", type=int, default=G["seed"])
     args = ap.parse_args()
 
-    sim = Sim(connect(args.tp, "tickerplant"), connect(args.rdb, "RDB"), args.seed)
+    tp, rdb = connect("tp", log), connect("rdb", log)       # publish + one-off ID lookup
+    sim = Sim(tp, rdb, args.seed)
 
-    print("Waiting for live quotes in the RDB...")
-    while len(sim.mid) < len(SYMS):
-        sim.refresh_mid()
-        time.sleep(1)
-    print("Mid prices:", sim.mid)
+    # separate subscription connection: the TP pushes quotes to it
+    async with kx.RawQConnection(host=CFG["host"], port=CFG["ports"]["tp"]) as sub:
+        await sub(".u.sub", kx.SymbolAtom("quotes"), kx.SymbolVector(SYMS))
+        log.info("Subscribed to quotes for %s; waiting for first prices", SYMS)
 
-    last_mid = last_print = time.time()
-    try:
-        while True:
-            now = time.time()
-            if now - last_mid >= args.mid_every:          # refresh the live mid once a second
-                sim.refresh_mid()
-                last_mid = now
-            if now - last_print >= 10:
-                print(f"open={len(sim.open)}", sim.stats)
-                last_print = now
-            sim.step()
-            time.sleep(1 / args.rate)
-    except KeyboardInterrupt:
-        print("Generator stopped:", sim.stats)
+        while len(sim.mid) < len(SYMS):
+            sim.drain_quotes(sub)
+            await asyncio.sleep(0.05)
+        log.info("Mid prices: %s", sim.mid)
+
+        last_print = time.time()
+        try:
+            while True:
+                sim.drain_quotes(sub)     # bring our market view up to date...
+                sim.step()                # ...then act on it
+                now = time.time()
+                if now - last_print >= 10:
+                    log.info("open=%d %s", len(sim.open), sim.stats)
+                    last_print = now
+                await asyncio.sleep(1 / args.rate)
+        finally:
+            log.info("Generator stopped: %s", sim.stats)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
