@@ -145,6 +145,9 @@ async def main():
                     log.info("open=%d %s", len(sim.open), sim.stats)
                     last_print = now
                 await asyncio.sleep(1 / args.rate)
+        except RuntimeError as e:
+            log.error("Lost connection to tickerplant (%s). Exiting so a supervisor can restart us.", e)
+            raise SystemExit(1)
         finally:
             log.info("Generator stopped: %s", sim.stats)
 
